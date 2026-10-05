@@ -2,12 +2,13 @@
 
 - Status: Proposed
 - Date: 2026-10-04
+- Language decision: Rust accepted on 2026-10-05; storage/query details remain proposed
 
 ## Context
 
 We need cross-cluster queries for object state at a time, field changes,
 likely actors, associated Events, and changes to related objects. The
-implementation may use native Go or Rust, with S3-compatible object storage as
+implementation will use native Rust, with S3-compatible object storage as
 the only durable dependency and configurable retention. Audit logs are initially
 unavailable; admission webhooks are allowed.
 Approximate attribution and observation-based timestamps are acceptable.
@@ -23,12 +24,16 @@ are not excluded. Parquet is a candidate format, not a product requirement.
 
 ## Decision
 
-Provisionally prefer Rust with [object-wal](https://github.com/thekb/object-wal) for durable ingestion,
-immutable Parquet for historical queries, and DataFusion as the embedded Rust
-query engine. This recommendation is conditional on verifying that the selected
-dependency features satisfy the native-language constraint. Keep object history
-separate from attribution evidence. Go remains viable as described below; the
-language choice is proposed, not finalized.
+Use Rust. Reuse [object-wal](https://github.com/thekb/object-wal) for durable
+ingestion, subject to integration verification. Parquet and DataFusion remain
+the proposed historical storage and query stack. Verify that selected dependency
+features satisfy the native-language constraint; replace incompatible dependencies
+rather than changing the accepted language or silently allowing FFI. Keep object
+history separate from attribution evidence. The Go comparison below records an
+alternative considered, not a pending language choice.
+
+[ADR 0002](0002-object-store-layout.md) specifies the proposed storage layout,
+temporal facts, indexes, and local query loading.
 
 ### Go versus Rust
 
@@ -71,13 +76,12 @@ publish data and indexes together. Standalone file readers do not supply an
 object-store database or automatic cross-file query planning. Do not introduce
 a custom file format until measurements justify its maintenance cost.
 
-Before accepting the language/format choice, compare cold and warm object-at-time,
+Before finalizing the format and query implementation, compare cold and warm object-at-time,
 timeline, and cross-cluster filtered queries on representative histories. Measure
 latency, peak memory, bytes read, S3 request count, and compaction cost. Verify
 restart from empty local storage, including retained history after WAL GC.
-Go builds must pass with cgo disabled; Rust must first pass the dependency audit
-and an S3 write/read plus query build using compliant features. If Rust cannot
-meet that constraint, use the Go candidate rather than silently allowing FFI.
+Rust must pass the dependency audit and an S3 write/read plus query build using
+compliant features. These checks validate library choices, not the language decision.
 
 ### Proposed Rust deployment
 
@@ -130,8 +134,9 @@ can share a binary; independent services are not required for the MVP.
 
 ### Persistence and publication
 
-Partition Parquet by dataset, cluster, and UTC observation day; sort object
-versions by UID and observation order. Flush on configurable time/size thresholds
+Partition Parquet by dataset, cluster, UTC recording day, and UID bucket as
+specified in ADR 0002; sort object versions by UID and observation order.
+Flush on configurable time/size thresholds
 and compact small files. WAL flushing and Parquet publication have independent
 intervals: durability and query freshness are different guarantees.
 
@@ -184,7 +189,7 @@ queries may remain expensive. Small-file compaction and catalog maintenance are
 required. Attribution remains approximate until stronger evidence is available.
 
 1. Verify native dependency/build constraints and compare representative query
-   workloads before accepting the stack. For Rust, add WAL cursor support and
+   workloads before finalizing the libraries. Add WAL cursor support and
    collector ingestion; test reconnects and deduplication.
 2. Implement Parquet publication/catalog recovery and object timeline/state queries.
 3. Add admission correlation, Events, and historical relationship traversal.
