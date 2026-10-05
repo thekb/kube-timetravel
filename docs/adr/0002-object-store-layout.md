@@ -52,15 +52,47 @@ time and rebuild/invalidate affected checkpoints for backdated changes.
 
 ### Object keys and partitioning
 
+All paths below are relative to the configured S3 prefix. There are two distinct
+layouts: cluster-scoped control/recovery objects, and dataset-first Hive tables.
+`objects`, `facts`, `admission`, and `events` are separate datasets, not values of
+an extra `dataset=` partition. The complete layout is:
+
 ```text
-v1/clusters/<cluster>/wal/                              # object-wal owns layout
-v1/clusters/<cluster>/catalog/head.json                 # conditional pointer
-v1/clusters/<cluster>/catalog/generations/<id>.json      # immutable roots
-v1/clusters/<cluster>/catalog/parts/<id>.json            # immutable file lists
-v1/<dataset>/cluster_id=<cluster>/recorded_day=<UTC>/bucket=<n>/<id>.parquet
-v1/indexes/<index>/cluster_id=<cluster>/recorded_day=<UTC>/bucket=<n>/<id>.parquet
-v1/clusters/<cluster>/checkpoints/<id>/<dataset>/bucket=<n>/<part>.parquet
+v1/
+  clusters/<cluster>/
+    wal/                                      # object-wal owns internal layout
+    catalog/head.json                         # conditional generation pointer
+    catalog/generations/<generation>.json      # immutable root
+    catalog/parts/<part>.json                  # immutable file descriptors
+    checkpoints/<checkpoint>/
+      manifest.json                           # cursor, coverage, file references
+      objects/bucket=<uid-bucket>/<part>.parquet
+      facts/bucket=<subject-bucket>/<part>.parquet
+      identity/bucket=<name-bucket>/<part>.parquet
+      reverse_edges/bucket=<target-bucket>/<part>.parquet
+  objects/cluster_id=<cluster>/recorded_day=<day>/bucket=<uid-bucket>/<segment>.parquet
+  facts/cluster_id=<cluster>/recorded_day=<day>/bucket=<subject-bucket>/<segment>.parquet
+  admission/cluster_id=<cluster>/recorded_day=<day>/bucket=<reference-bucket>/<segment>.parquet
+  events/cluster_id=<cluster>/recorded_day=<day>/bucket=<reference-bucket>/<segment>.parquet
+  indexes/identity/cluster_id=<cluster>/recorded_day=<day>/bucket=<name-bucket>/<segment>.parquet
+  indexes/reverse_edges/cluster_id=<cluster>/recorded_day=<day>/bucket=<target-bucket>/<segment>.parquet
 ```
+
+`<day>` is a UTC date such as `2026-10-05`; bucket numbers are rendered consistently
+within a layout. Unresolved evidence uses `bucket=unresolved`. All segment/part IDs
+are unique immutable file IDs. Checkpoints are state at a cursor, not change events,
+so their paths use checkpoint IDs rather than recording-day partitions.
+
+| Stored table | Bucket input | Row order within a segment |
+| --- | --- | --- |
+| objects | Object UID | UID, observed_at, WAL position |
+| facts | Subject UID | Subject, predicate, effective_at, WAL position |
+| admission / events | Resolved referenced UID | Referenced UID, recorded_at, WAL position |
+| indexes/identity | Encoded API group/kind/namespace/name | Name tuple, UID, observed_at, WAL position |
+| indexes/reverse_edges | Target UID | Target, subject, predicate, effective_at, WAL position |
+
+Checkpoint tables use the corresponding bucket function above. Each contains
+many objects or edges; no checkpoint or segment is a per-Pod file.
 
 Use dataset-first Hive-style `key=value` paths for segments and indexes, with no
 hour partition initially. Each dataset has a cross-cluster table root. This naming
@@ -99,6 +131,10 @@ Catalog roots reference immutable catalog parts, active files, checkpoints,
 coverage gaps, retention boundary, and the next unread WAL chunk. File entries
 include size, checksum, row count, layout/schema versions, bucket, time bounds,
 and source cursor ranges. Avoid bucket-wide listing on the query path.
+Each catalog-part reference also summarizes dataset, buckets, and time ranges,
+allowing readers to select file-list parts without downloading the whole catalog.
+Time bounds refer to columns explicitly (for example `observed_at_min/max`), not
+an ambiguous single time range.
 
 Publish secondary indexes with the same catalog generation:
 
@@ -174,6 +210,48 @@ the system does not generate a replacement Pod identity. Assume complete collect
 coverage for this example. Initial listing only establishes observation from that
 point onward, not earlier history; gaps make lifetime boundaries uncertain.
 
+#### What is written to S3
+
+Assume 16 buckets, name tuple `(core, Pod, payments, api-0)` maps to 07, uid-A maps
+to 03, and uid-B maps to 11. These mappings are illustrative, not hash test vectors.
+Checkpoint `cp-0955` captures the state at 09:55. Each name below is a concrete
+instance of the path template in **Object keys and partitioning**:
+
+| File (under `v1/`) | Example rows / purpose |
+| --- | --- |
+| `clusters/prod/checkpoints/cp-0955/identity/bucket=07/part-1.parquet` | Name tuple -> uid-A; first observed 09:00, still open |
+| `clusters/prod/checkpoints/cp-0955/objects/bucket=03/part-1.parquet` | uid-A's last version before the checkpoint, including full JSON and original version ID/time |
+| `indexes/identity/cluster_id=prod/recorded_day=2026-10-05/bucket=07/identity-1.parquet` | CLOSE uid-A at 10:15; OPEN uid-B at 10:16 |
+| `objects/cluster_id=prod/recorded_day=2026-10-05/bucket=03/objects-a.parquet` | uid-A full versions at 10:02 and 10:10; deletion at 10:15 |
+| `objects/cluster_id=prod/recorded_day=2026-10-05/bucket=11/objects-b.parquet` | uid-B full versions at 10:16 and 10:18 |
+
+Rows include other objects sharing those buckets. An object update stores the
+entire observed JSON, not just the changed status. The essential physical columns
+are `object_uid: string`, `version_id: string`, `observed_at: timestamp(us, UTC)`,
+`operation: string`, `object_json: nullable string`, `chunk_seq: uint64`, and
+`record_index: uint32`, plus the common envelope and identity columns. A deletion
+uses `operation=DELETE`; its JSON may be absent. resourceVersion remains a string.
+
+Identity rows contain the name tuple, UID, `operation=OPEN|CLOSE`, `observed_at`,
+provenance, and replay position. They are updates to a lifetime, not rewritten
+S3 rows: replay OPEN/CLOSE records to derive the half-open lifetime intervals.
+Checkpoint identity rows store the active lifetimes and their original start
+times. Retained identity segments preserve lifetimes closed after that checkpoint.
+
+Path-derived `recorded_day` and `bucket` are virtual scan columns supplied from
+catalog entries, not duplicated in Parquet payloads. Keep `cluster_id` in payloads
+for self-identification; the scan adapter validates it against the catalog/path
+and exposes one column, not a second inferred partition column. Checkpoint scans
+use their explicit schema and manifest rather than Hive partition inference.
+
+The materializer batches these rows in memory, sorts and writes Parquet, and
+uploads the immutable files. It publishes their descriptors, checkpoint references,
+and consumed cursor through the catalog protocol above. The query never discovers
+`objects-a.parquet` by assuming it is the only file in bucket 03; the pinned catalog
+enumerates every active candidate file, including additional flushes and compactions.
+
+#### How the query reads those files
+
 1. **Resolve the name.** Pin prod's catalog and hash `(core, Pod, payments, api-0)`
    into the identity-index bucket. Read the identity checkpoint preceding 10:00
    and subsequent identity updates through 10:20. This includes objects first
@@ -184,10 +262,8 @@ point onward, not earlier history; gaps make lifetime boundaries uncertain.
 2. **Select object buckets.** Suppose the catalog's layout maps uid-A to bucket 03
    and uid-B to bucket 11. Candidate segments then have paths such as:
 
-   ```text
-   v1/objects/cluster_id=prod/recorded_day=2026-10-05/bucket=03/<id>.parquet
-   v1/objects/cluster_id=prod/recorded_day=2026-10-05/bucket=11/<id>.parquet
-   ```
+   The candidate files include `objects-a.parquet` and `objects-b.parquet` at
+   the full paths listed above, plus any other files admitted by catalog bounds.
 
    Consult every layout applicable to the pinned history if bucket counts changed.
    Other UIDs share each bucket; apply an exact UID filter as well.
@@ -205,6 +281,27 @@ point onward, not earlier history; gaps make lifetime boundaries uncertain.
    paths under `/status`. Match conditions by `type` and container statuses by
    `name`; use schema-defined list semantics elsewhere rather than treating all
    arrays as unordered. Distinguish missing values, nulls, additions, and removals.
+
+For step 4, register a DataFusion scan over the explicit candidate file list.
+Conceptually, its row predicate is:
+
+```sql
+SELECT object_uid, version_id, observed_at, operation, object_json,
+       chunk_seq, record_index
+FROM selected_object_segments
+WHERE cluster_id = 'prod'
+  AND object_uid IN ('uid-A', 'uid-B')
+  AND observed_at >= TIMESTAMP '2026-10-05 10:00:00'
+  AND observed_at <  TIMESTAMP '2026-10-05 10:20:00'
+ORDER BY object_uid, observed_at, chunk_seq, record_index;
+```
+
+Use UTC session semantics and typed bound parameters in implementation. This query
+returns interval versions only; step 3 supplies the separate pre-interval baseline.
+S3 range reads fetch Parquet footers and required column chunks/pages, with cache
+and request coalescing. Statistics can reject row groups but do not guarantee that
+only matching rows' bytes are downloaded. Rust domain logic consumes the ordered
+results and computes semantic JSON diffs; SQL does not interpret condition-list keys.
 
 An illustrative result is:
 
