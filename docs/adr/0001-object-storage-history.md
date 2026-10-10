@@ -1,211 +1,174 @@
-# ADR 0001: Kubernetes history on object storage
+# ADR 0001: Kubernetes history with Rust and DuckLake
 
-- Status: Proposed
+- Status: Accepted for the POC; runtime and performance validation pending
 - Date: 2026-10-04
-- Language decision: Rust accepted on 2026-10-05; storage/query details remain proposed
+- Updated: 2026-10-10
+- Supersedes: the proposed object-store-only catalog and object-wal ingestion design
 
 ## Context
 
 We need cross-cluster queries for object state at a time, field changes,
-likely actors, associated Events, and changes to related objects. The
-implementation will use native Rust, with S3-compatible object storage as
-the only durable dependency and configurable retention. Audit logs are initially
-unavailable; admission webhooks are allowed.
-Approximate attribution and observation-based timestamps are acceptable.
+likely actors, associated Events, and changes to related objects. Audit logs are
+initially unavailable; admission webhooks are allowed. Approximate attribution
+and observation-based timestamps are acceptable.
 
-No persistent volumes, local database, or external metadata database may be
-required for recovery. Memory and optional temporary disk are disposable caches
-or query scratch space. WAL, data, indexes, checkpoints, and catalogs live in
-object storage. Buffered records are not durable until uploaded.
-
-Interpret the native-language constraint as no cgo/FFI or statically/dynamically
-linked C/C++ libraries; ordinary Go/Rust compilation and platform runtime linkage
-are not excluded. Parquet is a candidate format, not a product requirement.
+Rust is the accepted implementation language. For the POC, use SQLite as a
+durable DuckLake metadata catalog and S3-compatible storage for Parquet data.
+This explicitly relaxes the earlier requirements that object storage be the only
+durable dependency and that every dependency avoid C/C++ linkage. SQLite is a
+native C dependency; using a Rust API does not make the dependency tree pure Rust.
+Other native dependencies, codecs, and TLS backends still need a build audit.
 
 ## Decision
 
-Use Rust. Reuse [object-wal](https://github.com/thekb/object-wal) for durable
-ingestion, subject to integration verification. Parquet and DataFusion remain
-the proposed historical storage and query stack. Verify that selected dependency
-features satisfy the native-language constraint; replace incompatible dependencies
-rather than changing the accepted language or silently allowing FFI. Keep object
-history separate from attribution evidence. The Go comparison below records an
-alternative considered, not a pending language choice.
+Use Rust, Apache DataFusion, and `datafusion-ducklake`, with one application writer
+owning all mutations of one SQLite-backed DuckLake catalog across all clusters.
+Readers execute through DataFusion against pinned DuckLake snapshots. The POC
+uses persistent local storage for SQLite; it does not require PostgreSQL or DuckDB.
 
-[ADR 0002](0002-object-store-layout.md) specifies the proposed storage layout,
-temporal facts, indexes, and local query loading.
+Use `write-sqlite` without enabling the DuckDB backend. Register an S3-compatible
+`object_store` with the query and write runtime. Pin a tested library revision and
+compatible DataFusion version rather than tracking upstream main implicitly.
+The evaluated upstream revision is recorded under References; these decisions
+are not a claim that its APIs or failure behavior have been validated locally.
 
-### Go versus Rust
+Do not implement the earlier custom S3 catalog generations, conditional head
+publication, or a separate object-wal ingestion layer for the initial POC.
+DuckLake owns file membership, metadata publication, and catalog snapshots.
+The application owns observation history, capture coverage, duplicate handling,
+attribution, historical relationships, and retention semantics.
 
-| Layer / tradeoff | Native Go candidate | Native Rust candidate |
-| --- | --- | --- |
-| Kubernetes / HTTP | `client-go` dynamic list/watch; `net/http` admission handler | `kube`; `axum` admission handler |
-| S3 | AWS SDK for Go v2 | Existing WAL adapter; `object_store` for queries |
-| Durable ingestion | Port the WAL protocol and its recovery tests to Go | Reuse object-wal, with cursor support and integration verification |
-| Parquet | `parquet-go/parquet-go`; typed rows and bounded batches | Arrow Rust `parquet`; Arrow batches |
-| Query execution | Fixed operations with application-owned file pruning, range reads, filtering, and joins | DataFusion supplies execution/optimization; application owns temporal semantics |
-| Broader queries | More implementation work as filters, joins, and aggregations grow | Existing SQL/DataFrame execution supports expansion without exposing public SQL |
-| Runtime / resource control | Goroutines; bound allocations and GC pressure during scans | Tokio; explicit ownership, with bounded batches and concurrency still required |
-| Build constraint | Verify the complete service with `CGO_ENABLED=0` | Audit transitive features, codecs, and TLS/crypto backends; Rust crates alone do not prove compliance |
+[ADR 0002](0002-object-store-layout.md) proposes the logical schema and query
+strategy. That schema remains open to refinement independently of this stack choice.
 
-Both stacks still need catalog publication, compaction, checkpoints, retention,
-attribution, and historical relationship logic. Neither language has a proven
-performance advantage for this workload without measurements. Go offers direct
-use of the official Kubernetes client; Rust reduces new work through WAL reuse
-and DataFusion's query machinery.
-
-In Go, expose fixed operations such as `GetObjectAt`, `ListChanges`,
-`GetRelatedChanges`, and `GetClusterStateAt`. Select files from the S3 catalog,
-prune row groups using statistics/Bloom filters, read through a cached S3 range
-adapter, and reconstruct/join bounded batches in Go. A Parquet reader is not a
-query engine; planning, memory limits, and join execution remain application work.
-Using the Rust WAL in-process through FFI is excluded for the Go option.
-
-### Storage format alternatives (either language)
-
-| Option | Fit | Decision |
-| --- | --- | --- |
-| Parquet on S3 | Column selection and broad time/filter scans; interoperable readers in Go and Rust | MVP default; benchmark object lookups |
-| Immutable sorted key-value files on S3 | UID/time seeks and prefix scans; Go can use Pebble's standalone `sstable` building blocks | Viable alternative, but requires remote-read integration, file merging, secondary indexes, and compaction |
-| Local Pebble/Badger database | Local ordered lookups | Not the persistence architecture; any optional cache must be fully disposable |
-| WAL-only scans | Minimal initial storage machinery | Useful for recovery, but queries grow with retained history; not the target query layout |
-
-An SSTable implementation would store `(cluster, uid, time, sequence)` keys and
-separate time/relationship indexes in immutable S3 files. Its manifest must
-publish data and indexes together. Standalone file readers do not supply an
-object-store database or automatic cross-file query planning. Do not introduce
-a custom file format until measurements justify its maintenance cost.
-
-Before finalizing the format and query implementation, compare cold and warm object-at-time,
-timeline, and cross-cluster filtered queries on representative histories. Measure
-latency, peak memory, bytes read, S3 request count, and compaction cost. Verify
-restart from empty local storage, including retained history after WAL GC.
-Rust must pass the dependency audit and an S3 write/read plus query build using
-compliant features. These checks validate library choices, not the language decision.
-
-### Proposed Rust deployment
+### Deployment and ownership
 
 ```text
-Per-cluster collector (watches, Events, admission webhook)
-    -> per-cluster object-wal
-    -> materializer
-    -> Parquet files + versioned catalog in object storage
-    -> DataFusion query service
+Per-cluster Kubernetes collectors (watches, Events, admission evidence)
+    -> bounded in-memory ingestion queue
+    -> one Rust writer: normalize, batch, upload, commit
+         -> Parquet in S3-compatible storage
+         -> DuckLake metadata in persistent SQLite
+    -> DataFusion queries over a pinned DuckLake snapshot
 ```
 
-### Components
+Initially the writer and query service share a process and the same local catalog.
+Collectors may be remote. A single writer means one owner across the whole POC,
+not one writer per cluster against a shared SQLite file. Ingestion, schema changes,
+compaction, and retention mutations are serialized by that owner. Multiple readers
+may run concurrently. There is no automatic writer failover or shared-filesystem
+SQLite deployment in scope.
 
-| Rust module | Responsibility |
-| --- | --- |
-| `collector` | Use `kube` list/watch with reconnects; observe Events; serve an always-allow validating webhook. |
-| `ingest` | Encode versioned records, assign stable record IDs, append to a cluster WAL, and supervise its processing loop. |
-| `materializer` | Consume WAL chunks, deduplicate replay, write Arrow/Parquet batches, and build state checkpoints. |
-| `catalog` | Publish active files, WAL cursors, checkpoints, coverage gaps, and retention boundaries using conditional object writes. |
-| `query` | Select catalog files, execute DataFusion queries, compute diffs, and resolve historical relationships. |
-| `retention` | Advance history boundaries safely, retire files, and invoke WAL garbage collection. |
+### Ingestion, batching, and durability
 
-Initially run one collector and one materializer owner per cluster. The modules
-can share a binary; independent services are not required for the MVP.
+1. Capture full observed versions and deletion markers, with stable record IDs,
+   original observation times, and cluster-qualified identities.
+2. Normalize and derive relationship records into a bounded in-memory batch.
+3. Stage all affected tables through `DuckLakeWriteTransaction`, upload their
+   Parquet files, and commit their metadata together as one catalog snapshot.
+4. Report durable acceptance only after successful commit. Receipt into memory
+   is not a durable acknowledgement.
 
-### Capture and data model
+Use time and byte limits to flush batches. Initial experimental settings are one
+second or 8 MiB of buffered payload, whichever comes first; neither is a proven
+optimum or a bound on total Arrow/Parquet process memory. Bound queue capacity,
+writer buffers, and concurrent uploads separately. Low-volume time flushes can
+still create small files; measure this before tuning compaction and partitioning.
+
+Keep `data_inlining_row_limit = 0` initially so payloads go to Parquet. The evaluated
+DataFusion integration makes inlining opt-in. SQLite inlining is a later option
+for frequent durable small commits, with explicit flushing and compatibility tests;
+it is not assumed to provide automatic background batching or maintenance.
+
+There is no separate ingestion WAL in the POC. Buffered observations can be lost
+on a process crash. A watch resume may recover some missed changes, but a relist
+only restores current state; it cannot recreate missed intermediate history.
+Admission evidence may be unrecoverable. On queue saturation or storage outage,
+bound memory, surface degraded capture, and record a coverage gap when writing
+resumes. Do not block the Kubernetes admission decision on storage availability.
+On restart, conservatively report uncertain coverage since the last persisted
+collector progress marker, rather than claiming uninterrupted capture.
+
+SQLite's own journal/WAL protects catalog transactions. It does not protect the
+application's in-memory queue. Add durable ingestion buffering only if requirements
+change to surviving pre-commit crashes or retaining a backlog during storage outages.
+
+### Commit failures and replay
+
+An upload without a successful catalog commit is not visible to queries. A hard
+crash can leave unreferenced objects; clean those only with safe age thresholds.
+A committed snapshot remains readable after process restart only if both catalog
+storage and referenced data survive.
+
+A single writer does not eliminate duplicates: commit may succeed before a caller
+receives acknowledgement. Preserve record IDs across retries, and reconcile a
+batch against committed history before resubmitting. Do not assume uniqueness
+constraints or exactly-once ingestion are supplied by DuckLake. The proposed
+batch receipt and record-ID strategy is specified in ADR 0002 and requires testing.
+
+### Capture and attribution
 
 - Start with Deployments, ReplicaSets, Pods, Services, EndpointSlices, Nodes,
-  and Events. Discover served API versions and make resource selection configurable.
-- Identify objects by `(cluster_id, object_uid)`; names are lookup attributes.
-  Store full observed versions and deletion markers, not patch chains.
-- Use a common envelope: schema version, record ID, cluster ID, source,
-  observation time, and source timestamp when available. Store resourceVersion
-  as an opaque value, not a timestamp or cross-cluster ordering key.
-- Store separate datasets for object versions, admission attempts, and Events.
-  Promote identity/time/filter fields into typed columns; retain arbitrary
-  object content as JSON. Exclude Secrets initially and redact configured fields
-  before they enter the WAL.
-- Admission evidence contains userInfo, operation/subresource, object identity
-  when available, old resourceVersion, and proposed changes. Match it to observed
-  versions using those fields and time proximity; report probable, ambiguous,
-  or unknown attribution. An admission attempt is not proof of a committed write.
-- Use fail-open webhooks with a short timeout and explicit subresource rules.
-  Queue capture asynchronously; exclude dry runs from history and configure
-  webhook side-effect declarations consistently. The MVP accepts loss of queued,
-  unflushed records on collector failure; expose failures and collection gaps.
-- A watch relist restores current state, not missed intermediate changes.
-  Reconcile disappeared objects without inventing exact deletion times.
-  Later audit-log ingestion supplies additional evidence through the same model.
+  and Events; discover served API versions and configure resource selection.
+- Identify objects by `(cluster_id, object_uid)`. Names are lookup attributes;
+  resourceVersion is opaque, not a timestamp or cross-cluster ordering key.
+- Exclude Secrets initially and redact configured fields before buffering them.
+- Store admission attempts separately from observed state. Match userInfo,
+  operation/subresource, identity, old resourceVersion, proposed changes, and
+  time proximity; report probable, ambiguous, or unknown attribution.
+- Use a fail-open, always-allow validating webhook with a short timeout. Queue
+  evidence asynchronously, exclude dry runs, and declare side effects consistently.
+  An admission attempt is not proof of a committed Kubernetes write.
+- Reconcile disappearance after relist without inventing an exact deletion time.
+  Track collection gaps and distinguish observed deletion from inferred absence.
 
-### Persistence and publication
+### Query consistency and temporal meaning
 
-Partition Parquet by dataset, cluster, UTC recording day, and UID bucket as
-specified in ADR 0002; sort object versions by UID and observation order.
-Flush on configurable time/size thresholds
-and compact small files. WAL flushing and Parquet publication have independent
-intervals: durability and query freshness are different guarantees.
+Pin one DuckLake snapshot for the complete logical request, including multiple
+SQL statements and relationship expansion. Published tables in that snapshot are
+consistent with the writer's batch commit. This does not make observations from
+independent Kubernetes clusters simultaneous.
 
-For each materialization batch:
+DuckLake snapshot timestamps describe publication, not Kubernetes observation time.
+Answer state-at-T and timelines using retained observation rows and application time
+columns. Keep deletions as appended domain records, rather than physically deleting
+older versions. A retention policy must preserve the baseline needed for unchanged
+objects; expiring catalog snapshots alone does not implement history retention.
 
-1. Read complete WAL chunks from the last committed cursor.
-2. Upload immutable Parquet files.
-3. Conditionally publish a new catalog generation containing both file references
-   and the next unread WAL chunk sequence.
-4. Only then advance WAL garbage collection, retaining a configurable replay margin.
+### Persistence and recovery
 
-Queries pin a catalog generation. Retired files remain available for a grace
-period longer than the enforced maximum query lifetime. Failed publication leaves
-unreferenced files for later cleanup; replay must not publish duplicate records.
-Compaction uses the same upload-before-publication protocol.
+SQLite is authoritative metadata, not a disposable cache. Preserve its volume
+across restarts and use a supported consistent backup procedure; copying a live
+main database file alone is not an adequate backup strategy. Restore a catalog
+backup with every object it references. S3 data files alone are not a complete
+recovery mechanism. Backup frequency determines recoverable catalog progress.
 
-The inspected local object-wal API acknowledges durable append before manifest
-publication, and its tailer yields records without positions. Before integration,
-expose chunk sequence/completion information (preferably complete chunk batches)
-for crash-safe cursors and GC. Verify publication/recovery behavior with tests;
-append acknowledgement alone is not a query-visibility guarantee.
+Initially defer destructive cleanup and history expiry. Before enabling either,
+validate restore, active-reader safety, and backup retention together. Keep files
+needed by retained snapshots, backups, or running queries. An eventual S3-only
+recovery requirement would require a separate architectural decision.
 
-### Queries and retention
+## Consequences and validation
 
-- Object timeline: read versions in the requested interval plus the preceding
-  version to compute the first diff.
-- State at T: load a preceding checkpoint and apply subsequent versions/deletions
-  through T. Checkpoints describe captured state at committed WAL cursors.
-- Related changes: resolve owner references, Pod-to-Node bindings, and
-  Service-to-EndpointSlice-to-Pod links from historical versions. Evaluate selectors
-  against historical labels. Join Events by object references and time; temporal
-  proximity is correlation, not causation.
-- Cross-cluster queries combine independent histories. Return per-cluster coverage
-  and publication progress; do not promise an atomic global snapshot.
-- Initially query published Parquet only. A queryable in-memory WAL tail is deferred.
-- Configure a history duration and optional soft byte budget. Before expiring older
-  history, publish a baseline of all objects still present at the new boundary;
-  preserve objects that have not changed recently. Reject queries before that boundary.
-- Under budget pressure shorten retained history and report the effective boundary.
-  Include baseline, WAL backlog, orphan files, and compaction headroom in accounting.
-  If the baseline alone exceeds the budget, report that the soft target cannot be met.
-- Application cleanup controls correctness. S3 Lifecycle is only a backstop for
-  disposable prefixes; blanket object-age expiration could remove referenced data.
+This removes custom catalog publication and ingestion-log machinery from the POC.
+It introduces a durable local catalog and a pre-commit observation-loss window.
+Single-writer ownership simplifies ordering and retries but limits ingestion scale
+and availability; those are acceptable POC tradeoffs.
 
-## Consequences and implementation sequence
+Before calling the implementation validated:
 
-Full versions simplify recovery and retention at the cost of storage. Parquet
-supports efficient filtered scans, but opaque JSON predicates and broad graph
-queries may remain expensive. Small-file compaction and catalog maintenance are
-required. Attribution remains approximate until stronger evidence is available.
-
-1. Verify native dependency/build constraints and compare representative query
-   workloads before finalizing the libraries. Add WAL cursor support and
-   collector ingestion; test reconnects and deduplication.
-2. Implement Parquet publication/catalog recovery and object timeline/state queries.
-3. Add admission correlation, Events, and historical relationship traversal.
-4. Implement checkpoints, retention, and compaction; test crashes around publication,
-   unchanged objects across expiry, deletions/recreation, and concurrent query cleanup.
-
-Defer patch-only storage, a dedicated graph database, a live query tail, and strict
-byte caps until workload measurements justify them.
+1. Build the pinned Rust/SQLite/S3 stack and inspect native dependencies.
+2. Verify multi-table commit, read-after-commit, and snapshot-pinned queries.
+3. Crash before upload, between upload and commit, and after commit before ack;
+   verify visibility, replay deduplication, orphan handling, and gap reporting.
+4. Restart with the existing SQLite volume and restore a consistent backup.
+5. Test recreation, equal timestamps, relists, relationship removal, and unchanged
+   objects; measure cold/warm query latency, memory, S3 requests, and file counts.
 
 ## References
 
+- [Evaluated datafusion-ducklake revision](https://github.com/datafusion-contrib/datafusion-ducklake/tree/e90981435e745f55034c5175e599e296f50ebdc6)
+- [Backend, transaction, and inlining compatibility](https://github.com/datafusion-contrib/datafusion-ducklake/blob/e90981435e745f55034c5175e599e296f50ebdc6/COMPATIBILITY.md)
+- [SQLite write feature and dependency configuration](https://github.com/datafusion-contrib/datafusion-ducklake/blob/e90981435e745f55034c5175e599e296f50ebdc6/Cargo.toml)
+- [Snapshot-pinned catalog API](https://github.com/datafusion-contrib/datafusion-ducklake/blob/e90981435e745f55034c5175e599e296f50ebdc6/src/catalog.rs)
 - [Kubernetes admission webhooks](https://kubernetes.io/docs/reference/access-authn-authz/extensible-admission-controllers/)
-- [DataFusion: Rust, Parquet, and object-store support](https://datafusion.apache.org/user-guide/introduction.html)
-- [Kubernetes client libraries](https://kubernetes.io/docs/reference/using-api/client-libraries/)
-- [AWS SDK for Go v2](https://github.com/aws/aws-sdk-go-v2)
-- [parquet-go readers, writers, and filtering primitives](https://github.com/parquet-go/parquet-go)
-- [Rust Parquet crate and features](https://docs.rs/parquet/latest/parquet/)
-- [Pebble standalone SSTable API](https://pkg.go.dev/github.com/cockroachdb/pebble/sstable)
-- [S3 Lifecycle behavior](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lifecycle-mgmt.html)

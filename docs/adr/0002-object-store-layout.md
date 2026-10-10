@@ -1,357 +1,249 @@
-# ADR 0002: Object-store layout for temporal facts and local queries
+# ADR 0002: DuckLake schema and historical query strategy
 
-- Status: Proposed
+- Status: Proposed; schema and query strategy to validate in the POC
 - Date: 2026-10-05
-- Builds on: [ADR 0001](0001-object-storage-history.md), which selects Rust
+- Updated: 2026-10-10
+- Builds on: [ADR 0001](0001-object-storage-history.md)
+- Supersedes: the custom S3 catalog, WAL cursors, and prescribed Hive file layout
 
 ## Context
 
-Queries need object history, historical relationships, attribution, and Events
-across clusters. S3-compatible storage is the only durable dependency. Query
-workers must recover with empty local storage and fetch bounded portions of
-history rather than replaying the entire WAL. No graph database service is needed.
+The accepted POC stack is Rust, DataFusion-DuckLake, persistent SQLite metadata,
+S3-compatible Parquet storage, and one writer. We need object state at a time,
+field-change timelines, historical relationships, Events, and approximate actor
+attribution across clusters. DuckLake provides storage snapshots; the application
+must still model Kubernetes history.
 
-## Decision
+## Proposed decision
 
-Store immutable batched segments, periodic state checkpoints, and their indexes
-in object storage. Use Parquet with the Rust Arrow/Parquet libraries initially;
-keep the logical schema independent of the file format. Use DataFusion and Rust
-domain logic for local queries. Memory and optional disk caches are disposable.
-Do not create an S3 object per Kubernetes version or relationship fact.
+Store full object observations and deletion markers as append-only rows. Derive
+relationships as complete edge sets tied to the source observation. Start with
+SQL filtering and latest-version selection over history, followed by Rust domain
+logic for semantic diffs and bounded relationship traversal. Defer checkpoints,
+reverse-edge duplication, and materialized field diffs until benchmarks justify them.
 
-### Records and time
+### Identity, time, and ordering
 
-Every record carries `schema_version`, `record_id`, `cluster_id`, `recorded_at`,
-and a replay position `(chunk_seq, record_index)` within its cluster WAL.
-Assign and preserve recording time at ingestion; do not replace it on replay.
-Use replay position to break equal-time ties, never Kubernetes resourceVersion.
+- `cluster_id` is a stable configured cluster identity; UIDs are only unique in
+  combination with it. A recreated object has a new Kubernetes UID.
+- `record_id` identifies an ingestion record and survives retries. Object watch
+  redelivery can be recognized from cluster, UID, resourceVersion, and observation
+  type; validate that scheme for relists and inferred absence. Do not collapse
+  distinct Event versions or repeated evidence just because the payload matches.
+- `observed_at` is the collector's UTC observation time, preserved on retry.
+  It is not a Kubernetes commit timestamp. Report clock-skew and collection limits.
+- `ingest_seq` is a writer-assigned monotonically increasing `BIGINT` order for
+  newly accepted records, persisted with each committed row and recovered at startup.
+  Retries of committed records retain the original value. It resolves ties in
+  observation time; it does not establish causal order across collectors.
+- Use timestamp columns with microsecond precision and UTC query semantics.
+  resourceVersion remains a string and is never sorted numerically for time order.
+- Store source timestamps separately when available. Retroactive correction and
+  full bitemporal queries are deferred; the POC serves observation-based history.
 
-| Dataset | Additional fields |
-| --- | --- |
-| `objects` | UID, kind, namespace, name, version ID, resourceVersion, observation time, full JSON or deletion marker |
-| `facts` | Subject UID, predicate, typed target (UID or scalar), effective time, ASSERT/RETRACT, evidence/version references |
-| `admission` | Attempt ID, actor, operation/subresource, target reference, proposed change, dry-run/outcome metadata when available |
-| `events` | Event UID/version, involved-object reference, source timestamps, reason, message, count/series metadata |
+### Logical tables
 
-Keep large object bodies out of relationship facts. Use cluster-qualified UIDs
-for identity; resolve name-only references against historical identity records.
-Keep unresolved references explicit rather than attaching them to a recreated object.
+Names below are tables in the DuckLake `history` schema, not separate databases.
+Use strings for extensible operation/relation values and enforce allowed values
+in Rust. DuckLake constraints are not assumed to enforce application invariants.
 
-`recorded_at` represents when the collector learned a fact; `effective_at`
-represents the best-known time it took effect. Initially effective time defaults
-to observation time. Source timestamps and their provenance remain separate.
-Do not claim exact cluster commit times or a global order across clusters.
-Use assertions/retractions as immutable records; derive half-open validity
-intervals during replay or compaction. Deduplicate by stable record ID, including
-deterministic IDs for derived facts. Preserve distinct edges of multi-valued predicates.
-
-The MVP serves observation-based history. Retroactive corrections and full
-two-axis queries are deferred: storing both times does not make checkpoint replay
-bitemporally correct automatically. A later implementation must filter by knowledge
-time and rebuild/invalidate affected checkpoints for backdated changes.
-
-### Object keys and partitioning
-
-All paths below are relative to the configured S3 prefix. There are two distinct
-layouts: cluster-scoped control/recovery objects, and dataset-first Hive tables.
-`objects`, `facts`, `admission`, and `events` are separate datasets, not values of
-an extra `dataset=` partition. The complete layout is:
-
-```text
-v1/
-  clusters/<cluster>/
-    wal/                                      # object-wal owns internal layout
-    catalog/head.json                         # conditional generation pointer
-    catalog/generations/<generation>.json      # immutable root
-    catalog/parts/<part>.json                  # immutable file descriptors
-    checkpoints/<checkpoint>/
-      manifest.json                           # cursor, coverage, file references
-      objects/bucket=<uid-bucket>/<part>.parquet
-      facts/bucket=<subject-bucket>/<part>.parquet
-      identity/bucket=<name-bucket>/<part>.parquet
-      reverse_edges/bucket=<target-bucket>/<part>.parquet
-  objects/cluster_id=<cluster>/recorded_day=<day>/bucket=<uid-bucket>/<segment>.parquet
-  facts/cluster_id=<cluster>/recorded_day=<day>/bucket=<subject-bucket>/<segment>.parquet
-  admission/cluster_id=<cluster>/recorded_day=<day>/bucket=<reference-bucket>/<segment>.parquet
-  events/cluster_id=<cluster>/recorded_day=<day>/bucket=<reference-bucket>/<segment>.parquet
-  indexes/identity/cluster_id=<cluster>/recorded_day=<day>/bucket=<name-bucket>/<segment>.parquet
-  indexes/reverse_edges/cluster_id=<cluster>/recorded_day=<day>/bucket=<target-bucket>/<segment>.parquet
-```
-
-`<day>` is a UTC date such as `2026-10-05`; bucket numbers are rendered consistently
-within a layout. Unresolved evidence uses `bucket=unresolved`. All segment/part IDs
-are unique immutable file IDs. Checkpoints are state at a cursor, not change events,
-so their paths use checkpoint IDs rather than recording-day partitions.
-
-| Stored table | Bucket input | Row order within a segment |
+| Table | Main columns | Meaning |
 | --- | --- | --- |
-| objects | Object UID | UID, observed_at, WAL position |
-| facts | Subject UID | Subject, predicate, effective_at, WAL position |
-| admission / events | Resolved referenced UID | Referenced UID, recorded_at, WAL position |
-| indexes/identity | Encoded API group/kind/namespace/name | Name tuple, UID, observed_at, WAL position |
-| indexes/reverse_edges | Target UID | Target, subject, predicate, effective_at, WAL position |
+| `object_versions` | `record_id`, `batch_id`, `cluster_id`, `object_uid`, `api_group`, `api_version`, `kind`, `namespace`, `name`, `resource_version`, `observed_at`, `ingest_seq`, `operation`, `provenance`, `object_json`, `schema_version` | Full observed JSON for `UPSERT`; nullable JSON for `DELETE`. Provenance distinguishes watch, relist, and inferred absence. |
+| `relationships` | `cluster_id`, `source_record_id`, `subject_uid`, `relation`, `target_uid`, `target_group`, `target_kind`, `target_namespace`, `target_name`, `resolution`, `derivation_version` | Complete set of extracted edges for a particular object version; targets may remain unresolved. |
+| `admission_attempts` | `record_id`, `batch_id`, `cluster_id`, `observed_at`, `ingest_seq`, `admission_uid`, `operation`, `subresource`, target identity/name, `old_resource_version`, `actor_json`, `proposed_object_json` | Evidence about attempted writes, not authoritative state changes. Dry runs are excluded. |
+| `events` | `record_id`, `batch_id`, `cluster_id`, `observed_at`, `ingest_seq`, `event_uid`, `resource_version`, involved-object identity/name, `reason`, `message`, source timestamps, count/series fields | Observed Event versions; repeated observations are not automatically separate incidents. |
+| `capture_coverage` | `record_id`, `batch_id`, `cluster_id`, `collector_id`, resource scope, `observed_at`, `ingest_seq`, `status`, `gap_start`, `gap_end`, `reason` | Progress and gap evidence; NULL gap end means unresolved. Missing coverage is not proof of completeness. |
+| `ingest_batches` | `batch_id`, `first_ingest_seq`, `last_ingest_seq`, `record_count`, `payload_digest` | Receipt committed atomically with the batch's data; supports retry reconciliation. |
 
-Checkpoint tables use the corresponding bucket function above. Each contains
-many objects or edges; no checkpoint or segment is a per-Pod file.
+Keep arbitrary Kubernetes payloads as JSON strings initially. Promote identity,
+time, operation, and commonly filtered attributes to typed columns. Avoid a full
+column per possible Kubernetes field or a generic EAV representation of every JSON
+leaf. For the initial POC, labels/selectors can be evaluated in Rust after bounded
+candidate selection; promote them only when measured workloads require it.
 
-Use dataset-first Hive-style `key=value` paths for segments and indexes, with no
-hour partition initially. Each dataset has a cross-cluster table root. This naming
-convention requires no Hive service. The catalog remains authoritative: configure
-DataFusion scans with only the pinned generation's files and partition values,
-not a recursive listing that could include orphan or superseded files.
+Namespace is normalized consistently (for example empty string for cluster-scoped
+resources). Name lookup uses API group and kind, not served API version, so a served
+version change does not manufacture a new object identity. Define a stable encoding
+for identities and record-ID hashes; do not hash ambiguous string concatenations.
 
-Partition changes by UTC recording day and a stable UID hash bucket. Hash the
-subject for facts, object UID for versions, and referenced UID for evidence when
-resolved; keep unresolved evidence in an explicit partition. Record hash algorithm,
-bucket count, and layout version in the catalog. Start with few buckets (one is
-valid); avoid thousands of tiny files. Readers honor old layouts after resharding.
-Compute `stable_hash(uid) % bucket_count` in the query planner; a UID filter does
-not automatically imply a bucket filter. Buckets group many objects without making
-one directory per UID. They help object lookups; broad scans may read all buckets.
+### Relationship representation
 
-Sort fact rows by subject, predicate, effective time, and replay position; sort
-object rows by UID, observation time, and replay position. Use typed filter columns,
-row-group statistics, and optional UID Bloom filters. Choose a compression codec
-only after verifying the no-C/C++ dependency constraint.
+For each UPSERT, extract the complete edge set from that version and publish it
+in the same transaction as `object_versions`. Examples include owner references,
+Pod-to-Node binding, EndpointSlice-to-Service association, and endpoint targetRefs.
+A version with zero edges deliberately replaces the previous nonempty set.
 
-Flush by bounded memory/size or elapsed time independently of WAL flushes.
-Compact small files later. Target file size, row-group size, and bucket count are
-benchmark parameters, not fixed correctness requirements.
-Daily partitions may contain many short-duration segments. Preserve useful time
-locality during compaction so file and row-group timestamp min/max can prune narrow
-queries; UID-first sorting alone does not guarantee narrow time ranges. Store exact
-times in typed timestamp columns. Catalog entries carry bounds for recording and
-observation/effective time separately; do not equate their ranges when selecting
-files. Add hourly partitions only if measured volume and pruning gains justify
-the increased number of partitions and smaller files.
+At time T, first select each subject's latest object version. Join edges using
+`relationships.source_record_id = object_versions.record_id` and `cluster_id`.
+Do not select the most recent row independently for each edge: a removed edge has
+no row in the new set and would otherwise incorrectly survive. DELETE observations
+remove the subject from active state without requiring separate edge retractions.
 
-### Catalog, indexes, and publication
+Resolve name-only targets against state at the query time and preserve uncertainty
+across recreation or gaps. A selector is a predicate over historical labels, not
+a permanent edge to today's matching Pods. Distinguish selector matches from
+observed EndpointSlice endpoints; they answer different questions.
 
-Catalog roots reference immutable catalog parts, active files, checkpoints,
-coverage gaps, retention boundary, and the next unread WAL chunk. File entries
-include size, checksum, row count, layout/schema versions, bucket, time bounds,
-and source cursor ranges. Avoid bucket-wide listing on the query path.
-Each catalog-part reference also summarizes dataset, buckets, and time ranges,
-allowing readers to select file-list parts without downloading the whole catalog.
-Time bounds refer to columns explicitly (for example `observed_at_min/max`), not
-an ambiguous single time range.
+Initially derive reverse traversal by filtering/joining this same table against
+active source versions. It may scan broadly, but avoids maintaining a second index.
+Add target-oriented materialization only after measuring reverse-query cost.
 
-Publish secondary indexes with the same catalog generation:
+### Atomic publication and idempotency
 
-- Reverse edges: target UID to subject, predicate, and canonical fact record.
-  Include assertions and retractions; use target-hash buckets for reverse lookup.
-- Historical identity: API group/kind/namespace/name to UID and observed lifetime,
-  within a cluster. Bucket by a stable, unambiguous encoding of that name tuple,
-  not UID, so name resolution does not scan every UID bucket. Capture initial
-  observations and later closures as immutable updates. Store coverage gaps and
-  closure provenance (observed deletion versus inferred absence after relist).
-- Time lookup: catalog time ranges select candidate files for broad change scans;
-  a separate per-change time index can wait for measurements.
+The single writer stages observations, derived relationships, evidence, coverage,
+and one `ingest_batches` receipt in a single `DuckLakeWriteTransaction`. Each batch
+uses a stable ID and payload digest for its retries. Independent SQL INSERTs are
+not assumed to share one transaction automatically.
 
-Start reverse lookups with compact duplicated edge metadata and stable logical
-record references rather than physical offsets that compaction would invalidate.
-Checkpoints include both forward and reverse active-edge views.
+After an uncertain caller outcome, look up the receipt in the committed catalog.
+An existing matching receipt means the batch is committed; a digest mismatch is
+an error. If absent, retry the retained batch. Collector redelivery may arrive in
+a different batch, so batch receipts alone are insufficient: additionally check
+stable record IDs and omit already committed records and their derived edges.
+Begin with a bounded recent-ID cache plus persisted lookup for cache misses.
+Measure lookup cost; no uniqueness enforcement or free indexed point lookup is
+assumed. This protocol requires explicit crash/retry tests.
 
-For each complete WAL range, upload all data/index files, upload the immutable
-catalog generation, then compare-and-swap `head.json`. The generation publishes
-files and consumed cursor together. On conflict, reload and retry without
-publishing duplicate records. Advance WAL GC only after this commit. Compaction
-uses the same protocol. Clean orphan uploads only after an age/ownership check
-ensures an active publication cannot still reference them.
+No WAL positions appear in the schema. Uncommitted in-memory batches can disappear
+on restart; coverage reporting must expose that limitation. Persistent batch
+receipts reconcile committed writes, not recover lost payloads.
 
-### Checkpoints and query loading
+### Query consistency
 
-Periodically checkpoint current object state, active edges, historical lookup
-state needed for replay, and the materializer's cursor. A checkpoint root records
-the included datasets/buckets and capture coverage; publish it only when complete.
-Keep retained change segments as well: current-state checkpoints alone cannot
-recover all historical queries after WAL deletion.
+Resolve and pin a DuckLake snapshot at the start of a logical request. Use
+`DuckLakeCatalog::with_snapshot` for every SQL stage in that request. This prevents
+name resolution, object selection, and relationship queries from seeing different
+publication batches. Pinning does not itself prevent maintenance from deleting
+files; destructive cleanup stays disabled until a reader-lifetime policy exists.
 
-For an object and its relationships at T:
+For a historical time T, query the pinned catalog's retained rows using
+`observed_at <= T`. Do not use a DuckLake snapshot timestamp as a substitute:
+materialization can publish an observation long after it was captured. A separate
+"what had been published then?" query could use catalog snapshots later.
 
-1. Pin a catalog generation per cluster and resolve historical UID if necessary.
-2. Load the relevant bucket portions of a checkpoint preceding T.
-3. Read candidate segments after its cursor; filter and replay through T.
-4. Expand neighbors in batches, consulting forward and reverse indexes. Load
-   their checkpoint/segment portions to the same time before traversing further.
-5. Fetch large object bodies and evidence only for the resulting objects.
+### State at T
 
-For A-to-B interval queries, include edges active at A and all edge changes through
-B. Preserve edge validity intervals through traversal: a multi-hop path is valid
-only where all its edges overlap, not merely because each existed sometime in
-the window. Include the preceding object version when computing the first diff.
+For a UID, select the latest observation at or before T, using `ingest_seq` to
+break timestamp ties. For cluster state, do the same per cluster-qualified UID.
+Filter deletion markers only AFTER selecting the latest version, or deleted
+objects will be resurrected from their preceding UPSERT.
 
-Load all candidate edges for each expanded subject before claiming completeness
-or evaluating absence. Enforce hop, byte, and result limits; return explicit
-incomplete/truncated coverage when limits or collection gaps prevent an answer.
-Bounded traversal is application logic over tables, not a separate graph service.
-
-Cache catalog generations, Parquet metadata, blocks, and reconstructed snapshots
-by immutable file/generation identity. Workers restart from S3 catalogs/checkpoints
-and remaining WAL. No local database or persistent volume is required.
-
-Minigraf is an optional future experiment for traversal over a reconstructed,
-bounded snapshot. It is not a persistence dependency or assumed temporal authority;
-reimporting facts must not substitute fresh database transaction times for original
-recording times. Adoption requires separate correctness and dependency checks.
-
-### Worked example: Pod status history by name
-
-Request: show status changes for `prod/payments/api-0` on 2026-10-05 over
-`[10:00, 10:20)` UTC. This name refers to two Pod lifetimes:
-
-| Cluster / namespace / name | Kubernetes metadata.uid | Observed lifetime |
-| --- | --- | --- |
-| prod / payments / api-0 | uid-A | [09:00, 10:15) |
-| prod / payments / api-0 | uid-B | [10:16, ongoing) |
-
-The UIDs here are illustrative. The collector stores Kubernetes `metadata.uid`;
-the system does not generate a replacement Pod identity. Assume complete collection
-coverage for this example. Initial listing only establishes observation from that
-point onward, not earlier history; gaps make lifetime boundaries uncertain.
-
-#### What is written to S3
-
-Assume 16 buckets, name tuple `(core, Pod, payments, api-0)` maps to 07, uid-A maps
-to 03, and uid-B maps to 11. These mappings are illustrative, not hash test vectors.
-Checkpoint `cp-0955` captures the state at 09:55. Each name below is a concrete
-instance of the path template in **Object keys and partitioning**:
-
-| File (under `v1/`) | Example rows / purpose |
-| --- | --- |
-| `clusters/prod/checkpoints/cp-0955/identity/bucket=07/part-1.parquet` | Name tuple -> uid-A; first observed 09:00, still open |
-| `clusters/prod/checkpoints/cp-0955/objects/bucket=03/part-1.parquet` | uid-A's last version before the checkpoint, including full JSON and original version ID/time |
-| `indexes/identity/cluster_id=prod/recorded_day=2026-10-05/bucket=07/identity-1.parquet` | CLOSE uid-A at 10:15; OPEN uid-B at 10:16 |
-| `objects/cluster_id=prod/recorded_day=2026-10-05/bucket=03/objects-a.parquet` | uid-A full versions at 10:02 and 10:10; deletion at 10:15 |
-| `objects/cluster_id=prod/recorded_day=2026-10-05/bucket=11/objects-b.parquet` | uid-B full versions at 10:16 and 10:18 |
-
-Rows include other objects sharing those buckets. An object update stores the
-entire observed JSON, not just the changed status. The essential physical columns
-are `object_uid: string`, `version_id: string`, `observed_at: timestamp(us, UTC)`,
-`operation: string`, `object_json: nullable string`, `chunk_seq: uint64`, and
-`record_index: uint32`, plus the common envelope and identity columns. A deletion
-uses `operation=DELETE`; its JSON may be absent. resourceVersion remains a string.
-
-Identity rows contain the name tuple, UID, `operation=OPEN|CLOSE`, `observed_at`,
-provenance, and replay position. They are updates to a lifetime, not rewritten
-S3 rows: replay OPEN/CLOSE records to derive the half-open lifetime intervals.
-Checkpoint identity rows store the active lifetimes and their original start
-times. Retained identity segments preserve lifetimes closed after that checkpoint.
-
-Path-derived `recorded_day` and `bucket` are virtual scan columns supplied from
-catalog entries, not duplicated in Parquet payloads. Keep `cluster_id` in payloads
-for self-identification; the scan adapter validates it against the catalog/path
-and exposes one column, not a second inferred partition column. Checkpoint scans
-use their explicit schema and manifest rather than Hive partition inference.
-
-The materializer batches these rows in memory, sorts and writes Parquet, and
-uploads the immutable files. It publishes their descriptors, checkpoint references,
-and consumed cursor through the catalog protocol above. The query never discovers
-`objects-a.parquet` by assuming it is the only file in bucket 03; the pinned catalog
-enumerates every active candidate file, including additional flushes and compactions.
-
-#### How the query reads those files
-
-1. **Resolve the name.** Pin prod's catalog and hash `(core, Pod, payments, api-0)`
-   into the identity-index bucket. Read the identity checkpoint preceding 10:00
-   and subsequent identity updates through 10:20. This includes objects first
-   observed on earlier days, so scanning only today's identity files is insufficient.
-   Select all lifetimes overlapping the interval: uid-A and uid-B. A point lookup
-   at 10:00 yields uid-A; at 10:17 it yields uid-B. At 10:15:30 no Pod was observed
-   present. If coverage is incomplete, report uncertainty rather than guessing.
-2. **Select object buckets.** Suppose the catalog's layout maps uid-A to bucket 03
-   and uid-B to bucket 11. Candidate segments then have paths such as:
-
-   The candidate files include `objects-a.parquet` and `objects-b.parquet` at
-   the full paths listed above, plus any other files admitted by catalog bounds.
-
-   Consult every layout applicable to the pinned history if bucket counts changed.
-   Other UIDs share each bucket; apply an exact UID filter as well.
-3. **Find the baseline.** For each UID already present at 10:00, load its full
-   state from the preceding checkpoint and apply subsequent versions strictly
-   before 10:00. Preserve the originating version ID/time in checkpoint rows.
-   This obtains the last observed version before the interval even if the Pod
-   has not changed for days. A Pod first seen inside the interval has no baseline;
-   present it as first observed, not a fabricated field transition.
-4. **Fetch changes.** Select files by catalog time bounds and bucket, then use
-   Parquet statistics and optional UID Bloom filters to skip irrelevant row groups.
-   Read matching versions/deletion markers in `[10:00, 10:20)`, ordered by observation
-   time and replay position. Time predicates need not correspond to hour directories.
-5. **Diff locally.** Compare adjacent full versions within each UID and report
-   paths under `/status`. Match conditions by `type` and container statuses by
-   `name`; use schema-defined list semantics elsewhere rather than treating all
-   arrays as unordered. Distinguish missing values, nulls, additions, and removals.
-
-For step 4, register a DataFusion scan over the explicit candidate file list.
-Conceptually, its row predicate is:
+Illustrative SQL (implementation uses typed parameters and UTC session semantics):
 
 ```sql
-SELECT object_uid, version_id, observed_at, operation, object_json,
-       chunk_seq, record_index
-FROM selected_object_segments
-WHERE cluster_id = 'prod'
-  AND object_uid IN ('uid-A', 'uid-B')
-  AND observed_at >= TIMESTAMP '2026-10-05 10:00:00'
-  AND observed_at <  TIMESTAMP '2026-10-05 10:20:00'
-ORDER BY object_uid, observed_at, chunk_seq, record_index;
+WITH ranked AS (
+    SELECT *,
+           ROW_NUMBER() OVER (
+               PARTITION BY cluster_id, object_uid
+               ORDER BY observed_at DESC, ingest_seq DESC
+           ) AS rn
+    FROM lake.history.object_versions
+    WHERE cluster_id = 'prod'
+      AND observed_at <= TIMESTAMP '2026-10-05 10:10:00'
+)
+SELECT *
+FROM ranked
+WHERE rn = 1 AND operation = 'UPSERT';
 ```
 
-Use UTC session semantics and typed bound parameters in implementation. This query
-returns interval versions only; step 3 supplies the separate pre-interval baseline.
-S3 range reads fetch Parquet footers and required column chunks/pages, with cache
-and request coalescing. Statistics can reject row groups but do not guarantee that
-only matching rows' bytes are downloaded. Rust domain logic consumes the ordered
-results and computes semantic JSON diffs; SQL does not interpret condition-list keys.
+For a UID lookup, push its identity filter into the inner query. For mutable
+attribute predicates (labels, node, phase), first select the latest version and
+then filter: filtering old matching versions first would return stale state.
+Return unknown/unobserved status when no observation exists; absence before the
+first observation does not establish that the object did not exist.
 
-An illustrative result is:
+### Timeline and name lookup
 
-| Time | UID | Field / lifecycle | Before -> After |
-| --- | --- | --- | --- |
-| 10:02 | uid-A | status.phase | Pending -> Running |
-| 10:02 | uid-A | status.conditions[type=Ready].status | False -> True |
-| 10:10 | uid-A | status.containerStatuses[name=api].restartCount | 0 -> 1 |
-| 10:15 | uid-A | lifecycle | Deleted |
-| 10:16 | uid-B | lifecycle | First observed, Pending |
-| 10:18 | uid-B | status.phase | Pending -> Running |
+A timeline over `[A, B)` needs all observations in that interval plus the last
+observation strictly before A for each UID. The pre-A row is a diff baseline,
+not a new event. Order by `(observed_at, ingest_seq)` within each UID and compare
+adjacent versions in Rust.
 
-Do not diff uid-A against uid-B: recreation is a lifecycle boundary. Queries by
-UID bypass name resolution. A net endpoint diff is a separate operation from the
-timeline; Ready -> NotReady -> Ready must remain visible in a timeline. Across a
-gap, label differences as changes between observed states with unknown intermediate
-transitions. Do not emit a checkpoint baseline as a new Kubernetes change.
+For lookup by `(cluster, group, kind, namespace, name)`, initially search retained
+identity columns without restricting discovery to the requested day. Collect
+candidate UIDs, then reconstruct their baselines and interval histories. This
+includes unchanged objects first seen long before A and handles name recreation.
+An index of explicit lifetimes can be added later; a date-only identity lookup
+would miss long-lived objects.
 
-Compute diffs on demand initially. If repeated queries justify it, materialize a
-derived `changes` dataset with UID, observation time, from/to version IDs, semantic
-field path, change type, old/new values, and diff algorithm version. Use the same
-cluster/day/UID-bucket layout and atomic catalog publication; full versions remain
-the source for state reconstruction. Identity and UID bucketing narrow the lookup,
-time metadata narrows reads, and checkpoints bound baseline reconstruction without
-any durable local index or whole-WAL replay.
+Worked example: `prod/payments/api-0` is uid-A until a deletion at 10:15, and a new
+uid-B is first observed at 10:16. A `[10:00, 10:20)` timeline loads uid-A's last
+pre-10:00 version, its changes and deletion, and uid-B's creation and subsequent
+versions. Never diff uid-A against uid-B. Return the 10:15–10:16 absence only to
+the extent supported by capture coverage; relist inference is not an exact deletion.
 
-### Retention and reader safety
+Semantic JSON diffs match conditions by `type` and container statuses by `name`,
+use schema-defined list semantics elsewhere, and distinguish missing from null.
+A Ready -> NotReady -> Ready sequence must remain two transitions even when the
+endpoint states match. Across a collection gap, report differences between observed
+states with unknown intermediate transitions.
 
-Before moving the earliest supported time, publish a boundary baseline containing
-all still-active object state and edges, including unchanged objects and reverse
-links. Preserve subsequent history and the evidence covered by its retention policy.
-Partition-age deletion alone is insufficient; rewrite mixed-age segments as needed.
+### Related changes and evidence
 
-Readers pin immutable generations. Retain retired files for longer than the maximum
-query duration plus catalog-cache staleness; expire stale cache entries before
-starting new queries. Apply the same policy to catalogs and checkpoints. Account
-for WAL backlog, indexes, baselines, old generations, and compaction headroom in the
-soft byte budget. Report the effective history boundary and unmet budget targets.
+For relationships at T, select active source versions, join their edge sets, resolve
+targets, and expand neighbors in bounded batches at the same T and pinned snapshot.
+Join Events and admission evidence by qualified identity and time; proximity does
+not prove causality. Mark attribution as probable, ambiguous, or unknown.
 
-## Consequences and validation
+For interval traversal, derive each source version's validity interval using its
+successor, including a pre-A baseline and the next boundary as needed. Intersect
+intervals along paths: edges that existed at disjoint times do not form a historical
+path. Bound hops, candidate rows, bytes, and results; return explicit truncation
+rather than claiming completeness. No graph database is required initially.
 
-This avoids a durable local database and fetches only relevant history for bounded
-queries, but costs secondary-index storage, compaction, and potentially several
-S3 request rounds per traversal. Broad queries can still scan many buckets.
+### Physical layout and performance
 
-Validate publication crashes, duplicate replay, empty-local-state recovery after
-WAL GC, object recreation, selector changes, reverse-edge removal, unchanged facts
-across expiry, interval-path overlap, and concurrent queries during cleanup.
-Also validate name resolution across days and recreation, name-hash versus UID-hash
-routing, baseline lookup for unchanged Pods, same-time ordering, condition-array
-reordering, and timeline transitions that cancel out in a net endpoint diff.
-Benchmark cold/warm lookups and cross-cluster scans for latency, memory, S3 bytes,
-request count, and compaction cost before finalizing physical sizing.
+DuckLake owns catalog metadata and file paths. Do not also maintain custom S3
+`head.json`, file-list manifests, or discover tables through recursive S3 listings.
+The earlier prescribed Hive paths and virtual partition-column scheme are withdrawn.
+
+Start with unpartitioned tables to avoid multiplying small files in a low-volume
+POC. Experiment with sorting object batches by `(cluster_id, object_uid,
+observed_at, ingest_seq)` and relationships by `(cluster_id, subject_uid,
+source_record_id)`. Verify writer sort support and resulting row-group statistics;
+SQL ORDER BY remains required for result ordering regardless of physical layout.
+
+DataFusion/DuckLake pruning may reduce reads using supported file and Parquet
+statistics, but there is no assumed UID B-tree index. State-at-T can require
+scanning substantial retained history. Measure cold/warm UID lookups, name timelines,
+cluster reconstruction, and reverse traversal before choosing date/cluster
+partitioning, hash buckets, checkpoint tables, or materialized changes. A row-count
+limit alone is inadequate for variable-sized Kubernetes JSON payloads.
+
+### Checkpoints and retention
+
+Checkpoints are deferred. If reconstruction becomes expensive, add application
+state checkpoints tied to a published history cutoff and original version IDs.
+A DuckLake catalog snapshot is a file/table version, not a precomputed Kubernetes
+state checkpoint. With delayed observations, checkpoint eligibility and invalidation
+need an explicit rule before adoption.
+
+Initially retain all history and disable destructive maintenance. Later, before
+advancing the supported history boundary R, preserve each object's last state at
+or before R plus subsequent changes, including relationship rows referenced by the
+baseline. Preserve deletion/identity evidence needed to distinguish absence,
+recreation, and unknown coverage. Publish the effective boundary and reject older
+queries. Expiring DuckLake snapshots alone does not remove old rows from an
+append-only table; row retention and catalog/file reclamation are separate steps.
+
+Cleanup must also respect active readers and SQLite backups. Benchmark compaction
+separately and test that it preserves logical history and snapshot reads.
+
+## Validation and open choices
+
+- Verify SQLite multi-table commits for zero-edge versions and batch receipts.
+- Test retry after commit-before-ack and redelivery under a new batch ID.
+- Verify timestamp types, tie-breaking, UID recreation, deletion filtering,
+  unchanged pre-window baselines, and mutable-attribute filtering.
+- Test edge removal, unresolved targets, selector changes, and interval overlap.
+- Measure JSON storage size, writer memory, commit latency, file counts, S3 bytes,
+  request counts, query latency, and record-ID lookup cost on realistic histories.
+- Decide from those results whether to enable inlining, add checkpoints, introduce
+  partitioning, or materialize reverse edges. None is required by the initial schema.
+
+## References
+
+- [Accepted stack and durability boundaries](0001-object-storage-history.md)
+- [DataFusion-DuckLake compatibility at the evaluated revision](https://github.com/datafusion-contrib/datafusion-ducklake/blob/e90981435e745f55034c5175e599e296f50ebdc6/COMPATIBILITY.md)
+- [Snapshot selection API](https://github.com/datafusion-contrib/datafusion-ducklake/blob/e90981435e745f55034c5175e599e296f50ebdc6/src/catalog.rs)
