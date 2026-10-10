@@ -1,2 +1,2 @@
-# kube-timetravel
-kubernetes time travel queries
+# timetravel experiments
+experiments with time travel queries
